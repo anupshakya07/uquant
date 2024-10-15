@@ -4,7 +4,8 @@ import numpy as np
 import random
 import scipy
 from sklearn.cluster import SpectralBiclustering
-
+from collections import defaultdict
+import math
 
 SOFTNESS = 5
 THRESHOLD = 0.5
@@ -29,6 +30,47 @@ def load_dataset(dataset_name):
         return graph, citeseer_full
 
 
+# This method counts the n_i(x, y) for the FOL and Hybrid formulas
+def count_ground_truths(edges_tuple, num_classes, num_clusters, node_to_cluster_idx, dist_soft_lt_inequality, labels):
+    G_FOL = np.zeros(shape=(num_clusters, num_classes))
+    G_HFOL = np.zeros(shape=(num_clusters, num_classes))
+    for i, edge in enumerate(edges_tuple):
+        if str(edge) in node_to_cluster_idx:
+            x = edge[0]
+            y = edge[1]
+            cid = node_to_cluster_idx[str(edge)]
+            for k in range(num_classes):
+                Cx = labels[x] == k
+                Cy = labels[y] == k
+                ## Class_k(edge[0]) < = > CLass_k(edge[1])
+                ##(¬Cy ∨ Cx) ∧ (¬Cx ∨ Cy)
+                satisfies = (not Cy or Cx) and (not Cx or Cy)
+                if satisfies:
+                    G_FOL[cid, k] += 1
+                    G_HFOL[cid, k] += dist_soft_lt_inequality[x][y][k]
+    print("G_FOL sum = ", G_FOL.sum())
+    print("G_HFOL sum = ", G_HFOL.sum())
+    return G_FOL, G_HFOL
+
+
+def estimate_ground_values(edges_tuple, num_classes, num_clusters, node_to_cluster_idx, auxiliary_vars,
+                           auxiliary_lt_softineq_vars, dist_soft_lt_inequality):
+    E_FOL = np.zeros(shape=(num_clusters, num_classes))
+    E_HFOL = np.zeros(shape=(num_clusters, num_classes))
+
+    for eid, edge in enumerate(edges_tuple):
+        if str(edge) in node_to_cluster_idx:
+            i = edge[0]
+            j = edge[1]
+            cid = node_to_cluster_idx[str(edge)]
+            for k in range(num_classes):
+                E_FOL[cid, k] += auxiliary_vars[eid, k].X
+                E_HFOL[cid, k] += (auxiliary_lt_softineq_vars[eid, k].X * dist_soft_lt_inequality[i][j][k])
+    print("E_FOL ground truth sum = ", E_FOL.sum())
+    print("E_HFOL ground value sum = ", E_HFOL.sum())
+    return E_FOL, E_HFOL
+
+
 def cluster(num_nodes, num_classes, num_clusters, distance_matrix_np, random_state=16):
     distance_matrix_trunc = distance_matrix_np[:num_nodes, :num_nodes]
 
@@ -38,19 +80,19 @@ def cluster(num_nodes, num_classes, num_clusters, distance_matrix_np, random_sta
     supernode_dict = dict()
     node_to_cluster_idx = dict()
     total_num_links = 0
-    for cluster_id in range(num_clusters):
+    for cluster_id in range(num_clusters*num_clusters):
         cluster_shape = clustering.get_shape(cluster_id)
         cluster_indices = clustering.get_indices(cluster_id)
         cluster_members = []
         for row in cluster_indices[0]:
             for column in cluster_indices[1]:
-                mem = (row, column)
+                mem = (row,column)
                 cluster_members.append(mem)
                 node_to_cluster_idx[str(mem)] = cluster_id
                 total_num_links += 1
         supernode_dict[cluster_id] = cluster_members
     print("Total  = ", total_num_links)
-    return supernode_dict, node_to_cluster_idx
+    return supernode_dict, node_to_cluster_idx, clustering
 
 
 def get_group_index(idx):
@@ -106,26 +148,26 @@ def cluster_fol(edges_tuple):
     return supernode_fol_dict, fol_node_to_cluster_idx
 
 
-def calculate_accuracy(class_vars, graph, num_nodes=500):
+def calculate_accuracy(class_vars, graph, num_classes, num_nodes=500):
     correct = 0
 
     for j in range(0, num_nodes):
-        for i in range(7):
+        for i in range(num_classes):
             if class_vars[j, i].X > 0:
                 if i == graph.ndata["label"][j].item():
                     correct += 1
     print("Accuracy = ", (correct / num_nodes) * 100)
 
 
-def cluster_edge_count(supernode_fol_dict, supernode_dict):
-    N_fol = dict()
-    N_hfol = dict()
-
-    for cid, edge_list in supernode_fol_dict.items():
-        N_fol[cid] = len(edge_list)
+def cluster_edge_count(supernode_dict, edges_tuple):
+    N_fol = defaultdict(int)
+    N_hfol = defaultdict(int)
 
     for cid, edge_list in supernode_dict.items():
-        N_hfol[cid] = len(edge_list)
+        for edge in edge_list:
+            if edge in edges_tuple:
+                N_fol[cid] += 1
+                N_hfol[cid] += 1
     return N_fol, N_hfol
 
 
@@ -161,6 +203,7 @@ def compute_distance_matrix(emb_vectors, num_nodes):
             distance_matrix_np[j, i] = round(dist, 3)
     return distance_matrix_np
 
+
 def generate_query(supernode_dict):
     query_list = []
     for cluster_id, cluster_edges in supernode_dict.items():
@@ -173,3 +216,93 @@ def generate_query(supernode_dict):
         sampled_edges = [x for x in sampled_edges if x not in query_list]
         query_list_2.append(sampled_edges[0])
     return query_list, query_list_2
+
+
+def get_clusterwise_scale_factors(dist_soft_lt_inequality, clusters, num_classes=6):
+    #
+    # Input: the matrix of the soft inequality values for each formulas. Dimension: [n x n x n_f]
+    #        where n is the number of nodes, n_f is the number of formulas
+    # Returns: A dictionary where key is the cluster ID and value is the scale factors for each formula
+    #
+
+    clusterwise_predicate_connections = {}
+    for cluster_id, cluster_pairs in clusters.items():
+        result_dict_1 = {}
+        result_dict_2 = {}
+        for pair in cluster_pairs:
+            first_pos, second_pos = pair
+            if first_pos not in result_dict_1:
+                result_dict_1[first_pos] = []
+            if second_pos not in result_dict_2:
+                result_dict_2[second_pos] = []
+            result_dict_1[first_pos].append(second_pos)
+            result_dict_2[second_pos].append(first_pos)
+        clusterwise_predicate_connections[cluster_id] = [result_dict_1, result_dict_2]
+
+    clusterwise_scale_factors = dict()
+    for cluster_id in clusters:
+        connection_vectors = list()
+        for fmla in range(num_classes):
+            conn_vector = list()
+            for predicate in range(2):
+                pred_val_connection = list()
+                for node_1, pairs in clusterwise_predicate_connections[cluster_id][predicate].items():
+                    summ = 0
+                    for node_2 in pairs:
+                        summ += dist_soft_lt_inequality[node_1][node_2][fmla]
+                    pred_val_connection.append(round(summ, 3))
+                conn_vector.append(max(pred_val_connection))
+            connection_vectors.append(conn_vector)
+        scale_factors = [max(v) for v in connection_vectors]
+        clusterwise_scale_factors[cluster_id] = scale_factors
+
+    return clusterwise_scale_factors
+
+def initialize_distances(num_nodes, supernode_fol_weights, supernode_hybrid_weights,
+                         node_to_cluster_idx, edges_tuple, num_classes):
+
+    formula_weights = np.zeros(shape=(len(edges_tuple), num_classes))
+    hybrid_formula_weights = np.zeros(shape=(len(edges_tuple), num_classes))
+
+    for eid, edge in enumerate(edges_tuple):
+        for k in range(num_classes):
+            w1 = round(random.uniform(0, 1), 2)
+            w2 = round(random.uniform(0, 1), 2)
+            if str(edge) in node_to_cluster_idx:
+                cid = node_to_cluster_idx[str(edge)]
+                w1 = supernode_fol_weights[cid][k]
+                w2 = supernode_hybrid_weights[cid][k]
+            formula_weights[eid, k] = w1
+            hybrid_formula_weights[eid, k] = w2
+
+    return formula_weights, hybrid_formula_weights
+
+def initialize_soft_inequalities(num_nodes, distance_matrix, num_classes):
+    dist_soft_lt_inequality = []
+    dist_soft_gt_inequality = []
+
+    for i in range(num_nodes):
+        temp_lt_row = []
+        temp_gt_row = []
+
+        for j in range(num_nodes):
+
+            temp_lt_third_dim = []
+            temp_gt_third_dim = []
+
+            distance = distance_matrix[i][j]  # embedding distance between nodes i and j
+
+            degree_lt = SOFTNESS * (distance - THRESHOLD)
+            degree_gt = SOFTNESS * (THRESHOLD - distance)
+            d_lt = -math.log(1 + math.exp(degree_lt))
+            d_gt = -math.log(1 + math.exp(degree_gt))
+
+            for k in range(num_classes):
+                temp_lt_third_dim.append(round(d_lt, 3))
+                temp_gt_third_dim.append(round(d_gt, 3))
+            temp_lt_row.append(temp_lt_third_dim)
+            temp_gt_row.append(temp_gt_third_dim)
+        dist_soft_lt_inequality.append(temp_lt_row)
+        dist_soft_gt_inequality.append(temp_gt_row)
+
+    return dist_soft_lt_inequality, dist_soft_gt_inequality
